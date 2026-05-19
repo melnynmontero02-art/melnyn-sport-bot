@@ -1,5 +1,5 @@
 // ============================================================
-//  MELNYN SPORT — Bot de WhatsApp con IA
+//  MELNYN SPORT — WhatsApp-bot.js
 //  v4.0 — Auto-guarda contactos nuevos en Google Contacts
 // ============================================================
 require('dotenv').config();

@@ -157,4 +157,4 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => res.send('🔥 MELNYN SPORT Bot v4.0 — Google Contacts activo'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Bot corriendo en puerto ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Bot corriendo en puerto ${PORT}`));

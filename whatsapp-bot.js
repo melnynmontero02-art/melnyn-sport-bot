@@ -54,22 +54,31 @@ app.post('/webhook', async (req, res) => {
   history.push({ role: 'user', content: userMsg });
   if (history.length > 10) history.splice(0, history.length - 10);
   
+ let reply;
+let attempts = 0;
+while (attempts < 3) {
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: 'claude-haiku-4-5',
       max_tokens: 300,
       system: SYSTEM_PROMPT,
       messages: history
     });
-    const reply = response.content[0].text;
-    history.push({ role: 'assistant', content: reply });
-    twiml.message(reply);
-    res.type('text/xml').send(twiml.toString());
+    reply = response.content[0].text;
+    break;
   } catch (error) {
-    console.error('ERROR:', error.message);
-    twiml.message('Disculpa bro, error técnico 😅 Visita instagram.com/MELNYNSPORT2');
-    res.type('text/xml').send(twiml.toString());
+    attempts++;
+    console.error(`Intento ${attempts}:`, error.message);
+    if (attempts < 3) await new Promise(r => setTimeout(r, 1500));
   }
+}
+if (reply) {
+  history.push({ role: 'assistant', content: reply });
+  twiml.message(reply);
+} else {
+  twiml.message('Un momento bro 👊 Te respondemos en breve. Mientras visita instagram.com/MELNYNSPORT2 🔥');
+}
+res.type('text/xml').send(twiml.toString());
 });
 
 app.get('/', (req, res) => res.send('MELNYN SPORT Bot activo 🔥'));

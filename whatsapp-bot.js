@@ -1,40 +1,40 @@
-// ============================================================
-//  MELNYN SPORT — WhatsApp-bot.js
-//  v4.0 — Auto-guarda contactos nuevos en Google Contacts
-// ============================================================
-
 require('dotenv').config();
-
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
+const { getPreciosMsg } = require('./precios');
+const { google } = require('googleapis');
 
 const app = express();
-
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// =====================================================
-// MEMORIA DE CONVERSACIONES
-// =====================================================
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const conversations = new Map();
+const contactosGuardados = new Set();
 
-const conversaciones = new Map();
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  'http://localhost:3001/callback'
+);
+oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+const peopleApi = google.people({ version: 'v1', auth: oauth2Client });
 
-// =====================================================
-// CONFIGURACIÓN CLAUDE
-// =====================================================
+async function agregarContactoGoogle(numero, primerMensaje) {
+  const numeroLimpio = numero.replace('whatsapp:', '').replace(/\s/g, '');
+  try {
+    await peopleApi.people.createContact({
+      requestBody: {
+        names: [{ givenName: 'Cliente WhatsApp', familyName: numeroLimpio }],
+        phoneNumbers: [{ value: numeroLimpio, type: 'mobile' }],
+        organizations: [{ name: 'MELNYN SPORT - WhatsApp' }]
+      }
+    });
+  } catch (err) { console.error('Google Contacts error:', err.message); }
+}
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
-
-// =====================================================
-// PROMPT PRINCIPAL
-// =====================================================
-
-const INDICADORES_DEL_SISTEMA = `
-
-Eres el vendedor oficial de MELNYN SPORT, una tienda dominicana de ropa urbana y streetwear masculino.
+const SYSTEM_PROMPT = `Eres el vendedor oficial de MELNYN SPORT, una tienda dominicana de ropa urbana y streetwear masculino.
 
 =====================================================
 PERSONALIDAD
@@ -86,35 +86,12 @@ USA PALABRAS COMO:
 
 EJEMPLOS:
 
-En vez de:
-“esa está durísima”
+En vez de "esa está durísima", di: "esa está demasiado exclusiva 🔥"
+En vez de "ese flow está matando", di: "ese flow se ve premium 👌"
+En vez de "tenemos modelos duros", di: "tenemos modelos exclusivos de la colección 🔥"
+En vez de "esa combinación rompe", di: "esa combinación se ve demasiado clean 👌"
 
-Di:
-“esa está demasiado exclusiva 🔥”
-
-En vez de:
-“ese flow está matando”
-
-Di:
-“ese flow se ve premium 👌”
-
-En vez de:
-“tenemos modelos duros”
-
-Di:
-“tenemos modelos exclusivos de la colección 🔥”
-
-En vez de:
-“esa combinación rompe”
-
-Di:
-“esa combinación se ve demasiado clean 👌”
-
-EVITA USAR:
-- durísimo
-- heavy
-- matando
-- bacanísimo
+EVITA USAR: durísimo, heavy, matando, bacanísimo
 
 =====================================================
 OBJETIVO
@@ -132,26 +109,15 @@ Tu objetivo es:
 PRODUCTOS
 =====================================================
 
-Vendemos:
-- Oversize
-- T-shirts premium
-- Jeans
-- Jackets
-- Sneakers
-- Gorras
-- Streetwear
-- Accesorios urbanos
+Vendemos: Oversize, T-shirts premium, Jeans, Jackets, Sneakers, Gorras, Streetwear, Accesorios urbanos
 
 =====================================================
 INSTAGRAM
 =====================================================
 
-Instagram oficial:
-https://instagram.com/melnynsport2
+Instagram oficial: https://instagram.com/melnynsport2
 
-SI EL CLIENTE QUIERE VER PRODUCTOS:
-Responde:
-
+SI EL CLIENTE QUIERE VER PRODUCTOS responde:
 "Claro bro 🔥 entra aquí y mira la colección exclusiva 👇
 https://instagram.com/melnynsport2
 
@@ -167,27 +133,15 @@ SI EL CLIENTE NO SABE EL NOMBRE:
 TALLAS Y SIZE
 =====================================================
 
-SI EL CLIENTE PREGUNTA:
-- qué size tienen
-- qué talla tienen
-- tienen XL
-- hay size
-- qué sizes quedan
+Tenemos: S, M, L, XL
 
-Responde natural.
-
-Ejemplos:
-
+Ejemplos de respuestas:
 "Sí bro 👌 tenemos S, M, L y XL disponibles 🔥"
-
 "Queda en M y L ahora mismo 👌"
-
 "Esa viene oversized bro 🔥"
-
 "Te recomiendo L para que te quede con flow premium 👌"
 
-Si no hay:
-
+Si no hay stock:
 "Esa talla se fue rápido bro 👀 pero tengo modelos exclusivos parecidos 🔥"
 
 =====================================================
@@ -195,33 +149,23 @@ DELIVERY Y PAGOS
 =====================================================
 
 - Delivery en toda República Dominicana
-- Horario:
-10:00 AM - 8:30 PM
+- Horario: 10:00 AM - 8:30 PM
 
 MÉTODOS DE PAGO:
 
 BANRESERVAS
-Cuenta de ahorros
-9600512917
+Cuenta de ahorros: 9600512917
 
 Banco BHD León
-Cuenta de ahorros
-24519040013
+Cuenta de ahorros: 24519040013
 
 POPULAR
-Cuenta de ahorros
-803833888
+Cuenta de ahorros: 803833888
 
-Titular:
-Esmelnyn Montero Rosario
+Titular: Esmelnyn Montero Rosario
+Cédula: 40225444914
 
-Cédula:
-40225444914
-
-Aceptamos:
-- transferencia
-- contra entrega
-- efectivo
+Aceptamos: transferencia, contra entrega, efectivo
 
 SI EL CLIENTE PREGUNTA CÓMO PAGAR:
 "Puedes pagar por transferencia o contra entrega bro 👌"
@@ -230,21 +174,16 @@ SI EL CLIENTE PREGUNTA CÓMO PAGAR:
 UBICACIÓN
 =====================================================
 
-Ubicación:
-F6MJ+VG, Santo Domingo Este 11501
+Ubicación: F6MJ+VG, Santo Domingo Este 11501
 
 SI EL CLIENTE PIDE UBICACIÓN:
-Responde:
-
-"Claro bro 👌 aquí te mando la ubicación 📍"
+"Claro bro 👌 aquí te mando la ubicación 📍 F6MJ+VG, Santo Domingo Este"
 
 =====================================================
 PEDIDOS
 =====================================================
 
-SI EL CLIENTE QUIERE ORDENAR:
-Pide:
-
+SI EL CLIENTE QUIERE ORDENAR pide:
 - nombre
 - dirección
 - sector
@@ -269,35 +208,23 @@ Método de pago:
 CLIENTES INDECISOS
 =====================================================
 
-SI EL CLIENTE NO SABE QUÉ ELEGIR:
-Pregunta:
+SI EL CLIENTE NO SABE QUÉ ELEGIR pregunta:
 - talla
 - color favorito
 - tipo de flow
 - ocasión
 
-Luego recomienda.
-
-Ejemplo:
+Luego recomienda. Ejemplo:
 "Esa oversized con unos tenis blancos se ve demasiado clean 🔥"
 
 =====================================================
 HABLAR CON HUMANO
 =====================================================
 
-SI EL CLIENTE QUIERE HABLAR CON HUMANO:
-Responde:
-
+SI EL CLIENTE QUIERE HABLAR CON HUMANO responde:
 "Claro bro 👌 te voy a comunicar con Melnyn."
 
-PALABRAS CLAVE:
-- humano
-- dueño
-- propietario
-- Melnyn
-- asesor
-- agente
-- representante
+PALABRAS CLAVE: humano, dueño, propietario, Melnyn, asesor, agente, representante
 
 =====================================================
 REGLAS IMPORTANTES
@@ -310,119 +237,54 @@ REGLAS IMPORTANTES
 - No repitas saludos
 - No mandes Instagram en todos los mensajes
 - Responde basado en el último mensaje
-- Mantén flow premium calle elegante
+- Mantén flow premium calle elegante`;
 
-`;
-
-// =====================================================
-// WEBHOOK WHATSAPP
-// =====================================================
-
-app.post('/whatsapp', async (req, res) => {
-  try {
-
-    const mensaje = req.body.Body || '';
-    const numero = req.body.From || '';
-
-    // ============================================
-    // GUARDAR MEMORIA
-    // ============================================
-
-    if (!conversaciones.has(numero)) {
-      conversaciones.set(numero, []);
-    }
-
-    const historial = conversaciones.get(numero);
-
-    historial.push({
-      role: 'user',
-      content: mensaje,
-    });
-
-    // ============================================
-    // DETECTAR HUMANO
-    // ============================================
-
-    const mensajeLower = mensaje.toLowerCase();
-
-    const palabrasHumano = [
-      'humano',
-      'dueño',
-      'propietario',
-      'melnyn',
-      'asesor',
-      'agente',
-      'representante',
-    ];
-
-    const quiereHumano = palabrasHumano.some(p =>
-      mensajeLower.includes(p)
-    );
-
-    if (quiereHumano) {
-
-      return res.send(`
-<Response>
-<Message>
-Claro bro 👌 te voy a comunicar con Melnyn.
-</Message>
-</Response>
-      `);
-
-    }
-
-    // ============================================
-    // RESPUESTA IA
-    // ============================================
-
-    const response = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 400,
-      system: INDICADORES_DEL_SISTEMA,
-      messages: historial,
-    });
-
-    const respuestaIA =
-      response.content[0].text || 'Dímelo bro 🔥';
-
-    historial.push({
-      role: 'assistant',
-      content: respuestaIA,
-    });
-
-    conversaciones.set(numero, historial);
-
-    // ============================================
-    // RESPUESTA WHATSAPP
-    // ============================================
-
-    res.send(`
-<Response>
-<Message>${respuestaIA}</Message>
-</Response>
-    `);
-
-  } catch (error) {
-
-    console.error(error);
-
-    res.send(`
-<Response>
-<Message>
-Bro hubo un problema 👀 intenta otra vez.
-</Message>
-</Response>
-    `);
-
+app.post('/webhook', async (req, res) => {
+  const incomingMsg = req.body.Body?.trim() || '';
+  const from = req.body.From;
+  const mediaUrl = req.body.MediaUrl0;
+  if (!from) return res.status(400).send('Bad Request');
+  
+  if (!contactosGuardados.has(from)) { 
+    contactosGuardados.add(from); 
+    agregarContactoGoogle(from, incomingMsg); 
   }
+  
+  const twiml = new twilio.twiml.MessagingResponse();
+  
+  if (!conversations.has(from)) conversations.set(from, []);
+  const history = conversations.get(from);
+  const userMsg = mediaUrl ? '[imagen enviada]' : incomingMsg;
+  history.push({ role: 'user', content: userMsg });
+  if (history.length > 10) history.splice(0, history.length - 10);
+  
+  let reply;
+  let attempts = 0;
+  while (attempts < 3) {
+    try {
+      const response = await anthropic.messages.create({
+        model: 'claude-haiku-4-5',
+        max_tokens: 300,
+        system: SYSTEM_PROMPT,
+        messages: history
+      });
+      reply = response.content[0].text;
+      break;
+    } catch (error) {
+      attempts++;
+      console.error(`Intento ${attempts}:`, error.message);
+      if (attempts < 3) await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+  if (reply) {
+    history.push({ role: 'assistant', content: reply });
+    twiml.message(reply);
+  } else {
+    twiml.message('Un momento bro 👊 Te respondemos en breve. Visita instagram.com/MELNYNSPORT2 🔥');
+  }
+  res.type('text/xml').send(twiml.toString());
 });
 
-// =====================================================
-// SERVIDOR
-// =====================================================
-
+app.get('/', (req, res) => res.send('MELNYN SPORT Bot activo 🔥'));
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🔥 MELNYN SPORT BOT activo en puerto ${PORT}`);
-});
+app.listen(PORT, '0.0.0.0', () => console.log(`Bot corriendo en puerto ${PORT}`));

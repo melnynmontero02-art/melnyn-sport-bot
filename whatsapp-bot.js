@@ -2,37 +2,18 @@ require('dotenv').config();
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
-const { getPreciosMsg } = require('./precios');
-const { google } = require('googleapis');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const conversations = new Map();
-const contactosGuardados = new Set();
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  'http://localhost:3001/callback'
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
 );
-oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-const peopleApi = google.people({ version: 'v1', auth: oauth2Client });
-
-async function agregarContactoGoogle(numero, primerMensaje) {
-  const numeroLimpio = numero.replace('whatsapp:', '').replace(/\s/g, '');
-  try {
-    await peopleApi.people.createContact({
-      requestBody: {
-        names: [{ givenName: 'Cliente WhatsApp', familyName: numeroLimpio }],
-        phoneNumbers: [{ value: numeroLimpio, type: 'mobile' }],
-        organizations: [{ name: 'MELNYN SPORT - WhatsApp' }]
-      }
-    });
-  } catch (err) { console.error('Google Contacts error:', err.message); }
-}
 
 const SYSTEM_PROMPT = `Eres el vendedor oficial de MELNYN SPORT, una tienda dominicana de ropa urbana y streetwear masculino.
 
@@ -281,24 +262,51 @@ REGLAS IMPORTANTES
 - Responde basado en el último mensaje
 - Mantén flow premium calle elegante`;
 
+async function getConversationHistory(from) {
+  try {
+    const { data, error } = await supabase
+      .from('conversations')
+      .select('*')
+      .eq('phone', from)
+      .order('created_at', { ascending: true })
+      .limit(10);
+    
+    if (error) throw error;
+    
+    return (data || []).map(row => ({
+      role: row.role,
+      content: row.content
+    }));
+  } catch (err) {
+    console.error('Error fetching history:', err.message);
+    return [];
+  }
+}
+
+async function saveMessage(from, role, content) {
+  try {
+    await supabase.from('conversations').insert({
+      phone: from,
+      role: role,
+      content: content
+    });
+  } catch (err) {
+    console.error('Error saving message:', err.message);
+  }
+}
+
 app.post('/webhook', async (req, res) => {
   const incomingMsg = req.body.Body?.trim() || '';
   const from = req.body.From;
   const mediaUrl = req.body.MediaUrl0;
   if (!from) return res.status(400).send('Bad Request');
   
-  if (!contactosGuardados.has(from)) { 
-    contactosGuardados.add(from); 
-    agregarContactoGoogle(from, incomingMsg); 
-  }
-  
   const twiml = new twilio.twiml.MessagingResponse();
   
-  if (!conversations.has(from)) conversations.set(from, []);
-  const history = conversations.get(from);
+  const history = await getConversationHistory(from);
   const userMsg = mediaUrl ? '[imagen enviada]' : incomingMsg;
   history.push({ role: 'user', content: userMsg });
-  if (history.length > 10) history.splice(0, history.length - 10);
+  await saveMessage(from, 'user', userMsg);
   
   let reply;
   let attempts = 0;
@@ -318,8 +326,10 @@ app.post('/webhook', async (req, res) => {
       if (attempts < 3) await new Promise(r => setTimeout(r, 1500));
     }
   }
+  
   if (reply) {
     history.push({ role: 'assistant', content: reply });
+    await saveMessage(from, 'assistant', reply);
     twiml.message(reply);
   } else {
     twiml.message('Un momento bro 👊 Te respondemos en breve. Visita instagram.com/MELNYNSPORT2 🔥');

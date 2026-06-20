@@ -1,160 +1,348 @@
-// ============================================================
-//  MELNYN SPORT — Bot de WhatsApp con IA
-//  v4.0 — Auto-guarda contactos nuevos en Google Contacts
-// ============================================================
 require('dotenv').config();
-
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
-const { getPreciosMsg } = require('./precios');
-const { google } = require('googleapis');
+const { createClient } = require('@supabase/supabase-js');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const conversations = new Map();
-const contactosGuardados = new Set(); // En memoria para esta sesión
 
-// ============================================================
-//  GOOGLE CONTACTS — Configuración
-// ============================================================
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  'http://localhost:3001/callback'
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
 );
 
-oauth2Client.setCredentials({
-  refresh_token: process.env.GOOGLE_REFRESH_TOKEN
+// Conexión a Neon (inventario del POS)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
 
-const peopleApi = google.people({ version: 'v1', auth: oauth2Client });
-
-async function agregarContactoGoogle(numero, primerMensaje) {
-  const numeroLimpio = numero.replace('whatsapp:', '').replace(/\s/g, '');
+// ── Consulta real al inventario ───────────────────────────────────────────────
+async function consultarInventario(busqueda) {
+  const client = await pool.connect();
   try {
-    await peopleApi.people.createContact({
-      requestBody: {
-        names: [{ givenName: 'Cliente WhatsApp', familyName: numeroLimpio }],
-        phoneNumbers: [{ value: numeroLimpio, type: 'mobile' }],
-        biographies: [{
-          value: `Cliente de MELNYN SPORT via WhatsApp\nPrimer mensaje: "${primerMensaje.substring(0, 80)}"\nFecha: ${new Date().toLocaleString('es-DO', { timeZone: 'America/Santo_Domingo' })}`,
-          contentType: 'TEXT_PLAIN'
-        }],
-        organizations: [{ name: 'MELNYN SPORT - WhatsApp' }]
+    const { rows } = await client.query(`
+      SELECT
+        p.name,
+        p.code,
+        p.sale_price,
+        p.status,
+        c.name AS category,
+        COALESCE(
+          json_agg(
+            json_build_object('size', v.size, 'color', v.color, 'quantity', v.quantity)
+            ORDER BY v.size, v.color
+          ) FILTER (WHERE v.id IS NOT NULL),
+          '[]'
+        ) AS variants
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      LEFT JOIN product_variants v ON v.product_id = p.id
+      WHERE
+        p.status != 'INACTIVE'
+        AND (
+          p.name ILIKE $1
+          OR c.name ILIKE $1
+          OR p.brand ILIKE $1
+          OR p.code ILIKE $1
+        )
+      GROUP BY p.id, p.name, p.code, p.sale_price, p.status, c.name
+      ORDER BY p.name
+      LIMIT 5
+    `, [`%${busqueda}%`]);
+
+    if (rows.length === 0) {
+      return `No encontré "${busqueda}" en el inventario actual.`;
+    }
+
+    return rows.map(p => {
+      const disponibles = p.variants.filter(v => v.quantity > 0);
+      const agotadas = p.variants.filter(v => v.quantity === 0);
+      const totalStock = p.variants.reduce((s, v) => s + v.quantity, 0);
+
+      let info = `*${p.name}* (${p.category})\n`;
+      info += `Precio: RD$${Number(p.sale_price).toLocaleString('es-DO')}\n`;
+
+      if (totalStock === 0) {
+        info += `Estado: AGOTADO ❌`;
+      } else {
+        info += `Disponible: ${totalStock} unidades\n`;
+        const tallaMap = {};
+        disponibles.forEach(v => {
+          if (!tallaMap[v.size]) tallaMap[v.size] = [];
+          tallaMap[v.size].push(`${v.color} (${v.quantity})`);
+        });
+        info += `Tallas/Stock: ${Object.entries(tallaMap).map(([t, c]) => `${t}: ${c.join(', ')}`).join(' | ')}`;
+        if (agotadas.length > 0) {
+          const agotadasTallas = [...new Set(agotadas.map(v => v.size))];
+          info += `\nAgotado en: ${agotadasTallas.join(', ')}`;
+        }
       }
-    });
-    console.log(`✅ Contacto agregado a Google: ${numeroLimpio}`);
-    return true;
-  } catch (err) {
-    console.error(`❌ Error Google Contacts: ${err.message}`);
-    return false;
+      return info;
+    }).join('\n\n');
+  } finally {
+    client.release();
   }
 }
 
-// ============================================================
-//  TRIGGERS DE PRECIOS
-// ============================================================
-const PRECIO_TRIGGERS = [
-  'precio', 'precios', 'cuánto', 'cuanto', 'cuesta', 'costo',
-  'vale', 'cuestan', 'valen', 'catalogo', 'catálogo', 'lista',
-  'que tienen', 'qué tienen', 'disponible', 'info'
-];
-
-function esPreguntaDePrecios(msg) {
-  const lower = msg.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  return PRECIO_TRIGGERS.some(t => lower.includes(t));
+async function listarCategorias() {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(`
+      SELECT c.name, COUNT(p.id) AS total
+      FROM categories c
+      LEFT JOIN products p ON p.category_id = c.id AND p.status != 'INACTIVE'
+      WHERE c.active = true
+      GROUP BY c.name
+      ORDER BY c.name
+    `);
+    if (rows.length === 0) return 'No hay categorías disponibles aún.';
+    return rows.map(r => `• ${r.name} (${r.total} productos)`).join('\n');
+  } finally {
+    client.release();
+  }
 }
 
-// ============================================================
-//  SYSTEM PROMPT
-// ============================================================
-const SYSTEM_PROMPT = `Eres MelBot, el asistente virtual de MELNYN SPORT, tienda de ropa masculina streetwear en República Dominicana.
+// ── Herramientas para Claude ──────────────────────────────────────────────────
+const tools = [
+  {
+    name: 'consultar_inventario',
+    description: 'Consulta el inventario real de la tienda para saber si hay stock de un producto, tallas disponibles y precio actual. Úsala cuando el cliente pregunte por disponibilidad, tallas, colores, stock o precio de algún producto.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        busqueda: {
+          type: 'string',
+          description: 'Nombre del producto, categoría o código a buscar (ej: "jean", "oversize", "gorra", "PRD-001")',
+        },
+      },
+      required: ['busqueda'],
+    },
+  },
+  {
+    name: 'listar_categorias',
+    description: 'Lista todas las categorías de productos disponibles en la tienda. Úsala cuando el cliente pregunte qué tipos de ropa o productos venden.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+];
 
-Tu estilo es 100% streetwear: directo, cool, urbano. Mezclas español dominicano con términos como "bro", "fire", "drip". Eres genuino, no robótico.
+const SYSTEM_PROMPT = `Eres el vendedor oficial de MELNYN SPORT, una tienda dominicana de ropa urbana y streetwear masculino.
 
-INFORMACIÓN DEL NEGOCIO:
-- Tienda física en Santo Domingo + ventas online
-- Horario: Lunes a Sábado, 9am a 7pm
-- Instagram: @MELNYNSPORT2
-- Métodos de pago: Efectivo, Transferencia bancaria, Pago contraentrega
+=====================================================
+INVENTARIO EN TIEMPO REAL
+=====================================================
 
-FLUJO CUANDO PREGUNTEN POR PRECIOS:
-1. Envía la lista de precios
-2. Diles que vean el catálogo en instagram.com/MELNYNSPORT2
-3. Pídeles que manden el cap del producto que quieren
+Tienes acceso directo al inventario real de la tienda a través de herramientas.
+SIEMPRE usa "consultar_inventario" cuando el cliente pregunte por:
+- disponibilidad de algún producto
+- tallas disponibles
+- precios
+- stock
+- colores disponibles
 
-CUANDO ALGUIEN MANDA UNA FOTO:
-- Confirma que la recibiste
-- Diles que el equipo responde enseguida
-- Pide su nombre para dar seguimiento
+NUNCA inventes precios ni stock. Si el cliente pregunta por algo, primero consulta.
 
-REGLAS:
-- Máximo 2-3 oraciones. Breve y directo.
-- Usa emojis: 🔥 👟 🧢 💯 ✅ 📸
-- NUNCA inventes precios específicos
-- Responde en español dominicano con toque streetwear`;
+=====================================================
+SALUDO INICIAL
+=====================================================
+Si escriben: hola, klk, qloq, buenas, hey, brot, ey, wey, qué lo que, cómo tá, alo
+Responde EXACTAMENTE: "Ey bro 👌 bienvenido a MELNYN SPORT 🔥 ¿Cómo podemos ayudarte?"
 
-// ============================================================
-//  WEBHOOK
-// ============================================================
+=====================================================
+PERSONALIDAD
+=====================================================
+
+- exclusiva
+- premium
+- moderna
+- segura
+- flow dominicano elegante
+- streetwear premium
+
+NO hables como robot. Habla como un vendedor real dominicano con flow premium.
+Respuestas cortas y naturales. Usa emojis moderadamente 🔥👌👟✨
+
+=====================================================
+FLOW Y LENGUAJE
+=====================================================
+
+USA: exclusivo, premium, fino, clean, elegante, top, flow, pieza exclusiva, colección exclusiva
+EVITA: durísimo, heavy, matando, bacanísimo
+
+=====================================================
+INSTAGRAM
+=====================================================
+
+Instagram oficial: https://instagram.com/melnynsport2
+
+SI EL CLIENTE QUIERE VER PRODUCTOS:
+"Claro bro 🔥 entra aquí y mira la colección exclusiva 👇
+https://instagram.com/melnynsport2
+Mándame capture del modelo que te guste 👌"
+
+=====================================================
+DELIVERY Y PAGOS
+=====================================================
+
+- Delivery en toda República Dominicana
+- Horario: 10:00 AM - 8:30 PM
+
+MÉTODOS DE PAGO:
+BANRESERVAS — Cuenta ahorros: 9600512917
+BHD León — Cuenta ahorros: 24519040013
+POPULAR — Cuenta ahorros: 803833888
+Titular: Esmelnyn Montero Rosario | Cédula: 40225444914
+Aceptamos: transferencia, contra entrega, efectivo
+
+=====================================================
+PEDIDOS
+=====================================================
+
+SI EL CLIENTE QUIERE ORDENAR pide:
+- nombre, dirección, sector, teléfono, talla, color, método de pago
+
+FORMATO DE CONFIRMACIÓN:
+PEDIDO CONFIRMADO 🔥
+Nombre:
+Teléfono:
+Dirección:
+Producto:
+Talla:
+Color:
+Método de pago:
+
+=====================================================
+UBICACIÓN
+=====================================================
+
+F6MJ+VG, Santo Domingo Este 11501
+
+=====================================================
+HABLAR CON HUMANO
+=====================================================
+
+SI EL CLIENTE QUIERE HABLAR CON HUMANO:
+"Claro bro 👌 te voy a comunicar con Melnyn."
+
+=====================================================
+REGLAS IMPORTANTES
+=====================================================
+
+- Nunca hables como bot
+- Nunca inventes precios ni stock — siempre consulta el inventario
+- Mantén conversación natural
+- No repitas saludos
+- Responde basado en el último mensaje`;
+
+// ── Historial de conversaciones ───────────────────────────────────────────────
+async function getConversationHistory(from) {
+  try {
+    const { data, error } = await supabase
+      .from('conversations')
+      .select('*')
+      .eq('phone', from)
+      .order('created_at', { ascending: true })
+      .limit(10);
+    if (error) throw error;
+    return (data || []).map(row => ({ role: row.role, content: row.content }));
+  } catch (err) {
+    console.error('Error fetching history:', err.message);
+    return [];
+  }
+}
+
+async function saveMessage(from, role, content) {
+  try {
+    const text = typeof content === 'string' ? content : JSON.stringify(content);
+    await supabase.from('conversations').insert({ phone: from, role, content: text });
+  } catch (err) {
+    console.error('Error saving message:', err.message);
+  }
+}
+
+// ── Webhook WhatsApp ──────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const incomingMsg = req.body.Body?.trim() || '';
   const from = req.body.From;
   const mediaUrl = req.body.MediaUrl0;
-
   if (!from) return res.status(400).send('Bad Request');
-
-  // ── Auto-guardar contacto nuevo en Google Contacts ─────────
-  if (!contactosGuardados.has(from)) {
-    contactosGuardados.add(from);
-    agregarContactoGoogle(from, incomingMsg || '[imagen]'); // Async, no bloquea la respuesta
-  }
-
-  console.log(`[${new Date().toLocaleString('es-DO')}] ${from}: ${incomingMsg}${mediaUrl ? ' [IMAGEN]' : ''}`);
 
   const twiml = new twilio.twiml.MessagingResponse();
 
-  // ── Precios ─────────────────────────────────────────────────
-  if (esPreguntaDePrecios(incomingMsg) && !mediaUrl) {
-    twiml.message(getPreciosMsg());
-    return res.type('text/xml').send(twiml.toString());
+  const history = await getConversationHistory(from);
+  const userMsg = mediaUrl ? '[imagen enviada]' : incomingMsg;
+  history.push({ role: 'user', content: userMsg });
+  await saveMessage(from, 'user', userMsg);
+
+  let reply = null;
+  let attempts = 0;
+
+  while (attempts < 3 && !reply) {
+    try {
+      // Primera llamada a Claude (puede usar tools)
+      const response = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 500,
+        system: SYSTEM_PROMPT,
+        tools,
+        messages: history,
+      });
+
+      // Si Claude quiere usar una herramienta
+      if (response.stop_reason === 'tool_use') {
+        const toolUse = response.content.find(b => b.type === 'tool_use');
+        let toolResult = '';
+
+        if (toolUse.name === 'consultar_inventario') {
+          toolResult = await consultarInventario(toolUse.input.busqueda);
+        } else if (toolUse.name === 'listar_categorias') {
+          toolResult = await listarCategorias();
+        }
+
+        // Segunda llamada con el resultado del tool
+        const response2 = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 500,
+          system: SYSTEM_PROMPT,
+          tools,
+          messages: [
+            ...history,
+            { role: 'assistant', content: response.content },
+            { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult }] },
+          ],
+        });
+
+        reply = response2.content.find(b => b.type === 'text')?.text;
+      } else {
+        reply = response.content.find(b => b.type === 'text')?.text;
+      }
+
+    } catch (error) {
+      attempts++;
+      console.error(`Intento ${attempts}:`, error.message);
+      if (attempts < 3) await new Promise(r => setTimeout(r, 1500));
+    }
   }
 
-  // ── Foto / cap ──────────────────────────────────────────────
-  if (mediaUrl) {
-    twiml.message('¡Recibido bro! 📸🔥 Nuestro equipo te confirma disponibilidad y precio ahora mismo. ¿Cuál es tu nombre para darte seguimiento? ✅');
-    return res.type('text/xml').send(twiml.toString());
-  }
-
-  // ── IA ──────────────────────────────────────────────────────
-  if (!conversations.has(from)) conversations.set(from, []);
-  const history = conversations.get(from);
-  history.push({ role: 'user', content: incomingMsg });
-  if (history.length > 10) history.splice(0, history.length - 10);
-
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 300,
-      system: SYSTEM_PROMPT,
-      messages: history
-    });
-    const reply = response.content[0].text;
-    history.push({ role: 'assistant', content: reply });
+  if (reply) {
+    await saveMessage(from, 'assistant', reply);
     twiml.message(reply);
-    res.type('text/xml').send(twiml.toString());
-  } catch (error) {
-    console.error('Error:', error.message);
-    twiml.message('Disculpa bro, hubo un error 😅 Visítanos en instagram.com/MELNYNSPORT2 🔥');
-    res.type('text/xml').send(twiml.toString());
+  } else {
+    twiml.message('Un momento bro 👊 Te respondemos en breve. Visita instagram.com/MELNYNSPORT2 🔥');
   }
+
+  res.type('text/xml').send(twiml.toString());
 });
 
-app.get('/', (req, res) => res.send('🔥 MELNYN SPORT Bot v4.0 — Google Contacts activo'));
-
+app.get('/', (req, res) => res.send('MELNYN SPORT Bot activo 🔥'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Bot corriendo en puerto ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Bot corriendo en puerto ${PORT} 🔥`));
